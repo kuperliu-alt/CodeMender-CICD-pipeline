@@ -1,0 +1,17 @@
+{
+  "name": "ecommerce-api",
+  "version": "2.0.0",
+  "description": "Modular Node.js / Express REST API for an e-commerce backend.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "private": true
+}

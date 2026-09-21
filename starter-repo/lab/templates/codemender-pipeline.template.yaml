@@ -1,0 +1,349 @@
+# =============================================================================
+# CodeMender CI/CD Guardrail: STARTER PIPELINE
+# =============================================================================
+# This pipeline is almost complete. Three things are missing, marked FIXME 1,
+# FIXME 2 and FIXME 3 below.
+#
+# It lives under lab/templates/ (outside .github/workflows/) so GitHub Actions
+# never picks it up. Copy it into place, then fix the three gaps:
+#
+#     mkdir -p .github/workflows
+#     cp lab/templates/codemender-pipeline.template.yaml \
+#        .github/workflows/codemender-pipeline.yml
+#
+# A completed reference lives at lab/solutions/codemender-pipeline.solution.yaml.
+# Try the three FIXMEs yourself first, then diff the two files.
+# =============================================================================
+
+name: CodeMender CI/CD Guardrail
+
+# Run on every push to main, plus a manual "Run workflow" button.
+# Documentation and lab-tooling changes are ignored so they do not burn CI time.
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore: [ '**.md', 'lab/**', '.gitignore' ]
+  workflow_dispatch:
+
+# What this workflow is allowed to do to your repository.
+permissions:
+  contents: write          # push the remediation branch
+  pull-requests: write     # open the autonomous remediation PR
+  #
+  # FIXME 1: One permission is missing, and it is the one that makes keyless
+  #   authentication possible. Without it GitHub refuses to mint the OIDC
+  #   token, and the auth step below fails with:
+  #
+  #       Unable to get ACTIONS_ID_TOKEN_REQUEST_URL
+  #
+  #   Add it here, following the same `scope: access-level` pattern as the two
+  #   lines above. The scope name is the one GitHub uses for OIDC ID tokens.
+
+# Settings shared by every step below.
+#   SCAN_PATH  one directory. The scan covers everything under it, and keeping
+#              it narrow is what makes this run in minutes rather than hours.
+#   CM_LIMIT   how many findings to verify and fix in a single run. The scan
+#              still reports everything it finds; this only caps the expensive
+#              agentic work that follows.
+env:
+  SCAN_PATH: src/services
+  CM_DOWNLOAD_URL: "https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media"
+  CM_MODEL: gemini-3.7-flash
+  CM_LIMIT: "1"
+
+jobs:
+  codemender-security:
+    name: Scan, Verify, and Patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # Pull the repository onto the runner. fetch-depth: 0 gets full history,
+      # which the pull request action needs to create a branch.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The keyless exchange. This action sends the runner's OIDC token to
+      # Google Cloud, receives a short-lived access token in return, and writes
+      # it to the runner as Application Default Credentials. Every later step,
+      # including cm, picks those credentials up automatically.
+      #
+      # Note that all three values come from repository variables. Nothing
+      # environment-specific is hardcoded, and no key file exists anywhere.
+      - name: Authenticate to Google Cloud (WIF / ADC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          project_id: ${{ vars.GCP_QUOTA_PROJECT }}
+
+      # Download and install the latest stable CodeMender CLI from Google Cloud
+      # Artifact Registry (https://docs.cloud.google.com/gemini-enterprise-agent-platform/codemender/set-up-environment),
+      # and add it to PATH so later steps can just call `cm`. Also point /bin/sh
+      # to bash so CodeMender's exploit verification runner supports bash scripts.
+      - name: Install CodeMender CLI (cm)
+        run: |
+          set -euo pipefail
+          sudo ln -sf /bin/bash /bin/sh
+          mkdir -p "$RUNNER_TEMP/cmbin"
+          curl -fsSL -o "$RUNNER_TEMP/cm-linux-amd64.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm-linux-amd64.zip" -d "$RUNNER_TEMP/cmbin"
+          chmod 0755 "$RUNNER_TEMP/cmbin/cm"
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cmbin/cm" --version
+
+      # Install project dependencies before any agent runs. This is purely a
+      # speed optimisation, not a correctness requirement.
+      #
+      # Without it, cm verify cannot resolve `express` while building its
+      # exploit harness, and the agent responds by searching the entire
+      # filesystem for it: `find / -name express`. That hits the 30 second
+      # command timeout, twice, for a full minute of wasted wall clock.
+      #
+      # node_modules/ is in .gitignore, so it survives the `git clean -fd`
+      # workspace reset that runs before every agent command. Install once
+      # here and it stays available for find, verify and fix alike.
+      #
+      # `|| true` is deliberate. A registry outage should not take down the
+      # security pipeline: the run simply degrades to the slower behaviour it
+      # had before this step existed.
+      - name: Install Application Dependencies
+        run: npm install --no-audit --no-fund || true
+
+      # Creates the .codemender/ workspace and local findings database, then
+      # tells cm two things about this project: where it lives, and how to
+      # undo changes to it.
+      #
+      # project_paths is the filesystem boundary for the agent. It matters more
+      # than it looks. Left unset, cm falls back to whatever it happens to be
+      # working on, which during verification is the single vulnerable file. The
+      # agent then cannot write the .exploit/ directory it needs to prove the
+      # bug, and every finding comes back EXPLOIT_FAILED.
+      #
+      # Setting it to the checkout is the alternative to --unrestricted: the
+      # sandbox stays switched on, it is just told where the project is. The
+      # agent can range across this repository and nowhere else.
+      #
+      # vcs.type tells cm this is a Git repository. Without it cm prints
+      # "No reset command configured" before every scan, verification and fix,
+      # and silently skips the workspace reset that is supposed to give each
+      # agent run a clean starting point. Setting it to git enables the
+      # built-in reset, which is:
+      #
+      #     git checkout HEAD -- . && git clean -fd
+      #
+      # Note there is no -x on that clean, so it spares ignored files. That is
+      # why .gitignore in this repo covers .codemender/ and gha-creds-*.json:
+      # those entries are not tidiness, they stop cm deleting its own findings
+      # database and this job's credentials halfway through the run.
+      - name: Initialize CodeMender Workspace
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          cm init || true
+          for CONFIG in "$HOME/.codemender/config.yaml" "$GITHUB_WORKSPACE/.codemender/config.yaml"; do
+            mkdir -p "$(dirname "$CONFIG")"
+            touch "$CONFIG"
+            if ! grep -q '^project_paths:' "$CONFIG" 2>/dev/null; then
+              printf '\nproject_paths:\n  - "%s"\n' "$GITHUB_WORKSPACE" >> "$CONFIG"
+            fi
+            sed -i 's/type: ""/type: "git"/' "$CONFIG" 2>/dev/null || true
+            if ! grep -q 'type: "git"' "$CONFIG" 2>/dev/null && ! grep -q 'type: git' "$CONFIG" 2>/dev/null; then
+              printf '\nvcs:\n  type: git\n' >> "$CONFIG"
+            fi
+            if ! grep -q '  - lab' "$CONFIG" 2>/dev/null; then
+              sed -i 's/  - node_modules/  - node_modules\n  - lab\n  - .github/' "$CONFIG" 2>/dev/null || true
+            fi
+          done
+          echo "Sandbox scoped to: $GITHUB_WORKSPACE"
+
+      - name: CodeMender Scan
+        id: scan
+        run: |
+          # FIXME 2: This command is missing its flags. Replace FLAGS_GO_HERE
+          #   using the flag table in the codelab. You need two things:
+          #     1. run without asking the user to confirm anything
+          #     2. pin the model to $CM_MODEL
+          #
+          #   Note: --sandbox=false is already included below because GitHub
+          #   Actions ubuntu-latest (Ubuntu 24.04+) restricts unprivileged
+          #   network namespace ioctls used by cm v0.8.0's built-in sbox.
+          cm find "$SCAN_PATH" --sandbox=false FLAGS_GO_HERE 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"
+
+      # Re-emit the findings as JSON for the triage script. This is a separate
+      # step guarded by always() so that a scan which finds problems still
+      # produces a report.
+      - name: Export Security Report
+        if: always()
+        run: |
+          cm report -f json > "$RUNNER_TEMP/cm-security-report.json" || true
+
+      # Reads the JSON and sets three step outputs: fix_ids, max_severity and
+      # high_critical. fix_ids holds only the HIGH and CRITICAL findings, sorted
+      # most severe first. That ordering is the whole point: without it a run
+      # limited to one fix could spend it on a LOW finding.
+      - name: Triage Findings
+        id: triage
+        run: |
+          python3 .github/scripts/cm_triage.py "$RUNNER_TEMP/cm-security-report.json"
+
+      # Walk the queue, confirm each finding is real, and patch the ones that
+      # survive. Stops after CM_LIMIT findings.
+      - name: Verify and Remediate
+        id: remediate
+        if: steps.triage.outputs.fix_ids != ''
+        run: |
+          set -uo pipefail
+
+          # Needed because this job commits: see the note further down.
+          git config user.name "codemender-bot"
+          git config user.email "codemender-bot@users.noreply.github.com"
+
+          COUNT=0
+          FIXED=0
+          SKIPPED=0
+
+          for FID in ${{ steps.triage.outputs.fix_ids }}; do
+            if [ "$COUNT" -ge "$CM_LIMIT" ]; then break; fi
+            COUNT=$((COUNT+1))
+
+            echo "::group::Verify $FID"
+            # cm verify asks the agent to write an exploit and then runs it, so
+            # a VERIFIED finding here has been demonstrated, not just asserted.
+            #
+            # Two separate flags are needed to make that work unattended, and
+            # they are not interchangeable. -y answers the per-action prompts.
+            # --bypass-warning answers a different gate: the one-off warning
+            # that the agent may run commands and write files. That gate is
+            # keyed on whether stdin is a terminal, so it always fires in CI.
+            # Omit --bypass-warning and verification dies on its first step
+            # with "warning not acknowledged", the finding stays OPEN, and the
+            # run quietly degrades to fixing without ever having verified.
+            yes | cm verify "$FID" -y --bypass-warning --sandbox=false --model "$CM_MODEL" \
+              2>&1 | tee "$RUNNER_TEMP/verify-$FID.cm.log" || true
+
+            # cm verify exits 0 whatever the verdict, so the answer has to be
+            # read back out of the findings database rather than from $?.
+            cm report -f json > "$RUNNER_TEMP/verified-$FID.json" || true
+            echo "::endgroup::"
+
+            if ! python3 .github/scripts/cm_verdict.py \
+                 "$RUNNER_TEMP/verified-$FID.json" "$FID"; then
+              SKIPPED=$((SKIPPED+1))
+              continue
+            fi
+
+            echo "::group::Fix $FID"
+            # FIXME 3: Replace FLAGS_GO_HERE. The cm verify call above is a
+            #   worked example, and this command takes the same flags (-y
+            #   --bypass-warning --model "$CM_MODEL") for the same reasons.
+            #
+            #   The rule worth remembering: any cm command that lets the agent
+            #   run commands or write files needs both -y and --bypass-warning.
+            #   That is verify and fix. cm find in FIXME 2 does not, because a
+            #   scan is read-only: FIND mode has those tools switched off, so
+            #   the warning never triggers.
+            #
+            #   Do not add --unrestricted. project_paths already gave the agent
+            #   this whole repository.
+            yes | cm fix "$FID" --sandbox=false FLAGS_GO_HERE 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+
+            # Safety net: if cm did not edit the files directly, recover the
+            # patch from the log and apply it by hand.
+            python3 .github/scripts/extract_cm_diff.py \
+              "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
+
+            if [ -s "$RUNNER_TEMP/fix-$FID.patch" ]; then
+              if git apply --check -p1 "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+                git apply -p1 "$RUNNER_TEMP/fix-$FID.patch"
+              elif git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+                git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
+              fi
+            fi
+            echo "::endgroup::"
+
+            # Commit before moving on. This is not tidiness, it is required:
+            # cm verify and cm fix both reset the working tree to HEAD before
+            # they start (git checkout HEAD -- . && git clean -fd, enabled by
+            # the vcs.type setting above). Leave this fix uncommitted and the
+            # next loop iteration deletes it.
+            #
+            # git add -A stages everything, including files the agent created
+            # that git has never seen. That is deliberate, because a real fix
+            # sometimes adds a new module. It is also why .gitignore has to be
+            # right: without it this line sweeps up the WIF credentials file,
+            # the .cm_project markers, and the working exploit payloads under
+            # .exploit/, and publishes all of them in the pull request.
+            if ! git diff --quiet; then
+              git add -A
+              git commit -q -m "fix(security): CodeMender remediation for $FID"
+              FIXED=$((FIXED+1))
+              echo "Committed fix for $FID"
+            else
+              echo "cm produced no file changes for $FID"
+            fi
+          done
+
+          echo "Considered $COUNT finding(s): $FIXED fixed, $SKIPPED dismissed."
+          echo "fixed=$FIXED" >> "$GITHUB_OUTPUT"
+          git --no-pager log --oneline "origin/main..HEAD" || true
+
+      # Bundle the commits made above into a branch and open a pull request.
+      - name: Open Remediation Pull Request
+        id: pr
+        if: steps.remediate.outputs.fixed != '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: codemender/auto-remediation
+          delete-branch: true
+          commit-message: "fix(security): CodeMender autonomous remediation"
+          title: "CodeMender: autonomous security remediation"
+          body: "Auto-remediated HIGH/CRITICAL findings via cm verify + cm fix."
+
+      # Generate visual HTML report with finding details, verification exploits,
+      # and patch diffs. Uploaded as a workflow artifact so participants can
+      # download and inspect it in their browser.
+      - name: Generate CodeMender HTML Report
+        if: always()
+        run: |
+          cm report -f html || true
+          if [ -f "$HOME/.codemender/reports/report.html" ]; then
+            cp "$HOME/.codemender/reports/report.html" "$RUNNER_TEMP/codemender-report.html"
+          fi
+
+      - name: Upload HTML Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-html-report
+          path: ${{ runner.temp }}/codemender-report.html
+          if-no-files-found: ignore
+
+      # Summarize LLM token usage across all commands executed in this run.
+      - name: CodeMender Token Usage Stats
+        if: always()
+        run: |
+          cm stats </dev/null || true
+
+      # The gate. always() guarantees this runs even if an earlier step failed,
+      # so a broken scan can never be mistaken for a clean bill of health.
+      #
+      # The gate counts what the scan found, not what is left after the fixes.
+      # That is intentional: the fixes are sitting in a pull request that a
+      # human has not reviewed or merged yet, so from the perspective of this
+      # commit nothing has actually been remediated.
+      - name: Security Gate
+        if: always()
+        run: |
+          FOUND="${{ steps.triage.outputs.high_critical }}"
+          PATCHED="${{ steps.remediate.outputs.fixed }}"
+          FOUND="${FOUND:-0}"
+          PATCHED="${PATCHED:-0}"
+          if [ "$FOUND" -gt 0 ]; then
+            echo "::error title=Deployment blocked::CodeMender found $FOUND HIGH/CRITICAL finding(s). $PATCHED proposed for remediation in the pull request, $((FOUND-PATCHED)) not yet addressed. Failing the pipeline."
+            exit 1
+          fi
