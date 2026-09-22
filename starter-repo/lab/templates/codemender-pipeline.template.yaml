@@ -55,7 +55,7 @@ jobs:
   codemender-security:
     name: Scan, Verify, and Patch
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     steps:
       # Pull the repository onto the runner. fetch-depth: 0 gets full history,
@@ -194,6 +194,8 @@ jobs:
       - name: Verify and Remediate
         id: remediate
         if: steps.triage.outputs.fix_ids != ''
+        timeout-minutes: 150
+        continue-on-error: true
         run: |
           set -uo pipefail
 
@@ -204,6 +206,7 @@ jobs:
           COUNT=0
           FIXED=0
           SKIPPED=0
+          echo "fixed=0" >> "$GITHUB_OUTPUT"
 
           for FID in ${{ steps.triage.outputs.fix_ids }}; do
             if [ "$COUNT" -ge "$CM_LIMIT" ]; then break; fi
@@ -280,7 +283,8 @@ jobs:
               git add -A
               git commit -q -m "fix(security): CodeMender remediation for $FID"
               FIXED=$((FIXED+1))
-              echo "Committed fix for $FID"
+              echo "fixed=$FIXED" >> "$GITHUB_OUTPUT"
+              echo "Committed fix for $FID (total fixed: $FIXED)"
             else
               echo "cm produced no file changes for $FID"
             fi
@@ -293,7 +297,7 @@ jobs:
       # Bundle the commits made above into a branch and open a pull request.
       - name: Open Remediation Pull Request
         id: pr
-        if: steps.remediate.outputs.fixed != '0'
+        if: always() && steps.remediate.outputs.fixed != '0' && steps.remediate.outputs.fixed != ''
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
