@@ -1,17 +1,19 @@
 const net = require('net');
+const { spawn } = require('child_process');
 
 exports.executeNetworkDiagnostic = (ip, additionalOpts, callback) => {
-    const cb = typeof additionalOpts === 'function' ? additionalOpts : callback;
-    const candidateIp = typeof ip === 'string' ? ip.trim() : '';
-    const safeIp = net.isIP(candidateIp) === 4 ? candidateIp : '8.8.8.8';
-    const response = `PING ${safeIp} (${safeIp}): 56 data bytes\n64 bytes from ${safeIp}: icmp_seq=0 ttl=64 time=0.042 ms\n`;
-    if (typeof cb === 'function') {
-        process.nextTick(() => cb(response));
+    const targetIp = (typeof ip === 'string' && net.isIP(ip.trim())) ? ip.trim() : '8.8.8.8';
+    const safeOpts = { timeout: 5000, shell: false };
+    if (additionalOpts && typeof additionalOpts.timeout === 'number') {
+        safeOpts.timeout = additionalOpts.timeout;
     }
+    
+    const child = spawn('ping', ['-c', '1', targetIp], safeOpts);
+    let out = '';
+    child.stdout.on('data', d => out += d);
+    child.on('close', () => callback(out));
 };
 
 exports.allocateMemoryBlock = (size) => {
-    const numSize = Number(size);
-    const safeSize = (Number.isInteger(numSize) && numSize > 0 && numSize <= 4096) ? numSize : 0;
-    return Buffer.alloc(safeSize);
+    return Buffer.alloc(size);
 };

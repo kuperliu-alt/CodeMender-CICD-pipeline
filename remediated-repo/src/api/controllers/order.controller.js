@@ -13,7 +13,7 @@ exports.checkout = async (req, res) => {
 
 exports.exportInvoice = (req, res) => {
     const size = parseInt(req.query.layoutSize, 10);
-    if (isNaN(size) || size <= 0 || size > 4096) return res.status(400).send('Invalid');
+    if (isNaN(size) || size <= 0) return res.status(400).send('Invalid');
     try {
         res.json({ block: checkoutService.generateInvoiceMemoryBlock(size) });
     } catch (e) {
@@ -22,26 +22,16 @@ exports.exportInvoice = (req, res) => {
 };
 
 exports.downloadDigitalItem = (req, res) => {
-    if (!req.query.file || typeof req.query.file !== 'string') {
-        return res.status(400).send('No file provided');
-    }
-    try {
-        const p = fileUtils.getSafeDownloadPath(req.query.file);
-        if (fs.existsSync(p) && fs.statSync(p).isFile()) {
-            const content = fs.readFileSync(p);
-            res.type('application/octet-stream').send(content);
-        } else {
-            res.status(404).send("File not found");
-        }
-    } catch (e) {
-        res.status(400).send("Invalid file path");
-    }
+    if(!req.query.file) return res.status(400).send('No file provided');
+    const p = fileUtils.getSafeDownloadPath(req.query.file);
+    if (fs.existsSync(p)) res.sendFile(p);
+    else res.status(404).send("File not found");
 };
 
 exports.paymentWebhook = (req, res) => {
     const sig = req.headers['stripe-signature'];
-    const expected = process.env.STRIPE_WEBHOOK_SECRET || "whsec_super-secret-system-token-xyz";
-    if (!sig || typeof sig !== 'string') return res.status(403).send("Missing signature");
+    const expected = "whsec_super-secret-system-token-xyz";
+    if (!sig) return res.status(403).send("Missing signature");
     if (checkoutService.verifyWebhook(sig, expected)) res.send("Processed Webhook");
     else res.status(403).send("Invalid signature payload");
 };

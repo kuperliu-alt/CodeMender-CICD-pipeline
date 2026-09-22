@@ -1,13 +1,13 @@
-const MAX_TRACKED_SESSIONS = 100;
-const activeSessions = [];
-
+let activeSessions = null;
 module.exports = (req, res, next) => {
-    if (activeSessions.length >= MAX_TRACKED_SESSIONS) {
-        activeSessions.shift();
-    }
-    activeSessions.push({
-        path: String(req.path || '/').slice(0, 256),
-        ts: Date.now()
-    });
+    const prev = activeSessions;
+    const tracker = function () { 
+        if (prev) console.log("Analytics ping triggered. (Never actually called)"); 
+    };
+    activeSessions = {
+        path: req.path,
+        ts: Date.now(),
+        buf: new Array(1000000).join('*')
+    };
     next();
 };

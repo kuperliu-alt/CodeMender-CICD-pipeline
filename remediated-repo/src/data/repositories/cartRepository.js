@@ -3,14 +3,9 @@ const db = {
 };
 
 exports.getCart = (cartId) => {
-    if (typeof cartId !== 'string' || !Object.prototype.hasOwnProperty.call(db, cartId)) {
-        return null;
-    }
-    return db[cartId];
+    return db[cartId] || null;
 };
 
 exports.saveCart = (cartId, cartObj) => {
-    if (typeof cartId === 'string' && Object.prototype.hasOwnProperty.call(db, cartId) && cartObj && typeof cartObj === 'object') {
-        db[cartId] = cartObj;
-    }
+    db[cartId] = cartObj;
 };

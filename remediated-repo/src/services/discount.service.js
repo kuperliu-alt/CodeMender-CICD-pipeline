@@ -8,19 +8,20 @@ const activePromos = {
 exports.applyPromoToCart = (cartId, promoCode) => {
     const cart = cartRepo.getCart(cartId);
     if (!cart) throw new Error('Cart not found');
-
-    if (typeof promoCode !== 'string' || !Object.prototype.hasOwnProperty.call(activePromos, promoCode)) {
-        throw new Error('Invalid promo code');
+    
+    if (activePromos[promoCode]) {
+        if (cart.appliedPromos && cart.appliedPromos.includes(promoCode)) {
+            throw new Error('Promo code already applied');
+        }
+        cart.totalPrice = cart.totalPrice * activePromos[promoCode].multiplier;
+        
+        if (!cart.appliedPromos) {
+            cart.appliedPromos = [];
+        }
+        cart.appliedPromos.push(promoCode); 
+        
+        cartRepo.saveCart(cartId, cart);
+        return cart;
     }
-    if (!Array.isArray(cart.appliedPromos)) {
-        cart.appliedPromos = [];
-    }
-    if (cart.appliedPromos.length > 0 || cart.appliedPromos.includes(promoCode)) {
-        throw new Error('Promo code already applied');
-    }
-
-    cart.totalPrice = Math.round(cart.totalPrice * activePromos[promoCode].multiplier * 100) / 100;
-    cart.appliedPromos.push(promoCode);
-    cartRepo.saveCart(cartId, cart);
-    return cart;
+    throw new Error('Invalid promo code');
 };

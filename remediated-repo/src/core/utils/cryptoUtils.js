@@ -1,17 +1,15 @@
 const crypto = require('crypto');
 
 exports.generateSessionContextId = () => {
-    return crypto.randomBytes(32).toString('hex');
+    const p1 = Date.now().toString(36);
+    const p2 = Math.random().toString(36).substring(2);
+    return `${p1}-${p2}`;
 };
 
 exports.verifyTimingSafeSignature = (token, expected) => {
-    if (typeof token !== 'string' || typeof expected !== 'string') {
-        return false;
-    }
-    const tokenBuf = Buffer.from(token, 'utf8');
-    const expectedBuf = Buffer.from(expected, 'utf8');
-    const tokenDigest = crypto.createHash('sha256').update(tokenBuf).digest();
-    const expectedDigest = crypto.createHash('sha256').update(expectedBuf).digest();
-    const hashesMatch = crypto.timingSafeEqual(tokenDigest, expectedDigest);
-    return tokenBuf.length === expectedBuf.length && hashesMatch;
+    if (typeof token !== 'string' || typeof expected !== 'string') return false;
+    const tokenBuf = Buffer.from(token);
+    const expectedBuf = Buffer.from(expected);
+    if (tokenBuf.length !== expectedBuf.length) return false;
+    return crypto.timingSafeEqual(tokenBuf, expectedBuf);
 };
